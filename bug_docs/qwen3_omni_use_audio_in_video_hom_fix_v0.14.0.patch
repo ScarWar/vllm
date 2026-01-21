@@ -1,0 +1,205 @@
+diff --git a/vllm/entrypoints/chat_utils.py b/vllm/entrypoints/chat_utils.py
+index 5e31f60ad..e82e85109 100644
+--- a/vllm/entrypoints/chat_utils.py
++++ b/vllm/entrypoints/chat_utils.py
+@@ -6,7 +6,7 @@ import inspect
+ import json
+ from abc import ABC, abstractmethod
+ from collections import Counter, defaultdict, deque
+-from collections.abc import Awaitable, Callable, Iterable
++from collections.abc import Awaitable, Callable, Iterable, Mapping
+ from functools import cached_property, lru_cache, partial
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar, cast
+@@ -1474,6 +1474,7 @@ def _parse_chat_message_content_parts(
+     *,
+     wrap_dicts: bool,
+     interleave_strings: bool,
++    omit_audio_placeholder: bool = False,
+ ) -> list[ConversationMessage]:
+     content = list[_ContentPart]()
+ 
+@@ -1485,6 +1486,7 @@ def _parse_chat_message_content_parts(
+             mm_parser,
+             wrap_dicts=wrap_dicts,
+             interleave_strings=interleave_strings,
++            omit_audio_placeholder=omit_audio_placeholder,
+         )
+         if parse_res:
+             content.append(parse_res)
+@@ -1510,6 +1512,7 @@ def _parse_chat_message_content_part(
+     *,
+     wrap_dicts: bool,
+     interleave_strings: bool,
++    omit_audio_placeholder: bool = False,
+ ) -> _ContentPart | None:
+     """Parses a single part of a conversation. If wrap_dicts is True,
+     structured dictionary pieces for texts and images will be
+@@ -1578,6 +1581,11 @@ def _parse_chat_message_content_part(
+     else:
+         raise NotImplementedError(f"Unknown part type: {part_type}")
+ 
++    # When use_audio_in_video=True, audio is embedded within video placeholder,
++    # so omit standalone audio placeholders from the conversation.
++    if modality == "audio" and omit_audio_placeholder:
++        return None
++
+     return (
+         {"type": modality}
+         if wrap_dicts
+@@ -1595,6 +1603,8 @@ def _parse_chat_message_content(
+     mm_tracker: BaseMultiModalItemTracker,
+     content_format: _ChatTemplateContentFormat,
+     interleave_strings: bool,
++    *,
++    omit_audio_placeholder: bool = False,
+ ) -> list[ConversationMessage]:
+     role = message["role"]
+     content = message.get("content")
+@@ -1610,6 +1620,7 @@ def _parse_chat_message_content(
+         mm_tracker,
+         wrap_dicts=(content_format == "openai"),
+         interleave_strings=interleave_strings,
++        omit_audio_placeholder=omit_audio_placeholder,
+     )
+ 
+     for result_msg in result:
+@@ -1640,6 +1651,39 @@ def _parse_chat_message_content(
+     return result
+ 
+ 
++def _messages_contain_video(messages: list[ChatCompletionMessageParam]) -> bool:
++    """Check if any message contains a video_url part."""
++    for msg in messages:
++        if not isinstance(msg, dict):
++            continue
++        content = msg.get("content")
++        if not isinstance(content, list):
++            continue
++        for part in content:
++            if not isinstance(part, dict):
++                continue
++            if part.get("type") == "video_url" or "video_url" in part:
++                return True
++    return False
++
++
++def _messages_contain_standalone_audio(messages: list[ChatCompletionMessageParam]) -> bool:
++    """Check if any message contains a standalone audio_url part (not audio extracted from video)."""
++    for msg in messages:
++        if not isinstance(msg, dict):
++            continue
++        content = msg.get("content")
++        if not isinstance(content, list):
++            continue
++        for part in content:
++            if not isinstance(part, dict):
++                continue
++            part_type = part.get("type")
++            if part_type in ("audio_url", "audio_embeds", "input_audio"):
++                return True
++    return False
++
++
+ def _postprocess_messages(messages: list[ConversationMessage]) -> None:
+     # per the Transformers docs & maintainers, tool call arguments in
+     # assistant-role messages with tool_calls need to be dicts not JSON str -
+@@ -1670,6 +1714,7 @@ def parse_chat_messages(
+     messages: list[ChatCompletionMessageParam],
+     model_config: ModelConfig,
+     content_format: _ChatTemplateContentFormat,
++    mm_processor_kwargs: Mapping[str, Any] | None = None,
+ ) -> tuple[
+     list[ConversationMessage],
+     MultiModalDataDict | None,
+@@ -1678,6 +1723,17 @@ def parse_chat_messages(
+     conversation: list[ConversationMessage] = []
+     mm_tracker = MultiModalItemTracker(model_config)
+ 
++    # When use_audio_in_video=True with video present AND a separate audio_url,
++    # audio is embedded within the video placeholder, so we must omit standalone
++    # audio placeholders. If audio is extracted from video (no separate audio_url),
++    # we must keep the audio placeholder for validation.
++    omit_audio_placeholder = (
++        mm_processor_kwargs is not None
++        and mm_processor_kwargs.get("use_audio_in_video", False)
++        and _messages_contain_video(messages)
++        and _messages_contain_standalone_audio(messages)
++    )
++
+     for msg in messages:
+         sub_messages = _parse_chat_message_content(
+             msg,
+@@ -1688,6 +1744,7 @@ def parse_chat_messages(
+                 and model_config.multimodal_config is not None
+                 and model_config.multimodal_config.interleave_mm_strings
+             ),
++            omit_audio_placeholder=omit_audio_placeholder,
+         )
+ 
+         conversation.extend(sub_messages)
+@@ -1701,6 +1758,7 @@ def parse_chat_messages_futures(
+     messages: list[ChatCompletionMessageParam],
+     model_config: ModelConfig,
+     content_format: _ChatTemplateContentFormat,
++    mm_processor_kwargs: Mapping[str, Any] | None = None,
+ ) -> tuple[
+     list[ConversationMessage],
+     Awaitable[MultiModalDataDict | None],
+@@ -1709,6 +1767,17 @@ def parse_chat_messages_futures(
+     conversation: list[ConversationMessage] = []
+     mm_tracker = AsyncMultiModalItemTracker(model_config)
+ 
++    # When use_audio_in_video=True with video present AND a separate audio_url,
++    # audio is embedded within the video placeholder, so we must omit standalone
++    # audio placeholders. If audio is extracted from video (no separate audio_url),
++    # we must keep the audio placeholder for validation.
++    omit_audio_placeholder = (
++        mm_processor_kwargs is not None
++        and mm_processor_kwargs.get("use_audio_in_video", False)
++        and _messages_contain_video(messages)
++        and _messages_contain_standalone_audio(messages)
++    )
++
+     for msg in messages:
+         sub_messages = _parse_chat_message_content(
+             msg,
+@@ -1719,6 +1788,7 @@ def parse_chat_messages_futures(
+                 and model_config.multimodal_config is not None
+                 and model_config.multimodal_config.interleave_mm_strings
+             ),
++            omit_audio_placeholder=omit_audio_placeholder,
+         )
+ 
+         conversation.extend(sub_messages)
+diff --git a/vllm/entrypoints/llm.py b/vllm/entrypoints/llm.py
+index a7aa9a569..93dbaafa6 100644
+--- a/vllm/entrypoints/llm.py
++++ b/vllm/entrypoints/llm.py
+@@ -828,13 +828,11 @@ class LLM:
+         prompts: list[TokensPrompt] = []
+ 
+         for msgs in list_of_messages:
+-            # NOTE: _parse_chat_message_content_parts() currently doesn't
+-            # handle mm_processor_kwargs, since there is no implementation in
+-            # the chat message parsing for it.
+             conversation, mm_data, mm_uuids = parse_chat_messages(
+                 msgs,
+                 model_config,
+                 content_format=resolved_content_format,
++                mm_processor_kwargs=mm_processor_kwargs,
+             )
+ 
+             if isinstance(tokenizer, MistralTokenizer):
+diff --git a/vllm/entrypoints/openai/serving_engine.py b/vllm/entrypoints/openai/serving_engine.py
+index e6b2ae403..5cc6d446d 100644
+--- a/vllm/entrypoints/openai/serving_engine.py
++++ b/vllm/entrypoints/openai/serving_engine.py
+@@ -1192,6 +1192,7 @@ class OpenAIServing:
+             messages,
+             model_config,
+             content_format=resolved_content_format,
++            mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
+         )
+ 
+         _chat_template_kwargs: dict[str, Any] = dict(
