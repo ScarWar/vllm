@@ -6,7 +6,7 @@ import inspect
 import json
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict, deque
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from functools import cached_property, lru_cache, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeAlias, TypeVar, cast
@@ -1474,6 +1474,7 @@ def _parse_chat_message_content_parts(
     *,
     wrap_dicts: bool,
     interleave_strings: bool,
+    omit_audio_placeholder: bool = False,
 ) -> list[ConversationMessage]:
     content = list[_ContentPart]()
 
@@ -1485,6 +1486,7 @@ def _parse_chat_message_content_parts(
             mm_parser,
             wrap_dicts=wrap_dicts,
             interleave_strings=interleave_strings,
+            omit_audio_placeholder=omit_audio_placeholder,
         )
         if parse_res:
             content.append(parse_res)
@@ -1510,6 +1512,7 @@ def _parse_chat_message_content_part(
     *,
     wrap_dicts: bool,
     interleave_strings: bool,
+    omit_audio_placeholder: bool = False,
 ) -> _ContentPart | None:
     """Parses a single part of a conversation. If wrap_dicts is True,
     structured dictionary pieces for texts and images will be
@@ -1578,6 +1581,11 @@ def _parse_chat_message_content_part(
     else:
         raise NotImplementedError(f"Unknown part type: {part_type}")
 
+    # When use_audio_in_video=True, audio is embedded within video placeholder,
+    # so omit standalone audio placeholders from the conversation.
+    if modality == "audio" and omit_audio_placeholder:
+        return None
+
     return (
         {"type": modality}
         if wrap_dicts
@@ -1595,6 +1603,8 @@ def _parse_chat_message_content(
     mm_tracker: BaseMultiModalItemTracker,
     content_format: _ChatTemplateContentFormat,
     interleave_strings: bool,
+    *,
+    omit_audio_placeholder: bool = False,
 ) -> list[ConversationMessage]:
     role = message["role"]
     content = message.get("content")
@@ -1610,6 +1620,7 @@ def _parse_chat_message_content(
         mm_tracker,
         wrap_dicts=(content_format == "openai"),
         interleave_strings=interleave_strings,
+        omit_audio_placeholder=omit_audio_placeholder,
     )
 
     for result_msg in result:
@@ -1638,6 +1649,39 @@ def _parse_chat_message_content(
         if role == "developer":
             result_msg["tools"] = message.get("tools", None)
     return result
+
+
+def _messages_contain_video(messages: list[ChatCompletionMessageParam]) -> bool:
+    """Check if any message contains a video_url part."""
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "video_url" or "video_url" in part:
+                return True
+    return False
+
+
+def _messages_contain_standalone_audio(messages: list[ChatCompletionMessageParam]) -> bool:
+    """Check if any message contains a standalone audio_url part (not audio extracted from video)."""
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type in ("audio_url", "audio_embeds", "input_audio"):
+                return True
+    return False
 
 
 def _postprocess_messages(messages: list[ConversationMessage]) -> None:
@@ -1670,6 +1714,7 @@ def parse_chat_messages(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
     content_format: _ChatTemplateContentFormat,
+    mm_processor_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[
     list[ConversationMessage],
     MultiModalDataDict | None,
@@ -1677,6 +1722,17 @@ def parse_chat_messages(
 ]:
     conversation: list[ConversationMessage] = []
     mm_tracker = MultiModalItemTracker(model_config)
+
+    # When use_audio_in_video=True with video present AND a separate audio_url,
+    # audio is embedded within the video placeholder, so we must omit standalone
+    # audio placeholders. If audio is extracted from video (no separate audio_url),
+    # we must keep the audio placeholder for validation.
+    omit_audio_placeholder = (
+        mm_processor_kwargs is not None
+        and mm_processor_kwargs.get("use_audio_in_video", False)
+        and _messages_contain_video(messages)
+        and _messages_contain_standalone_audio(messages)
+    )
 
     for msg in messages:
         sub_messages = _parse_chat_message_content(
@@ -1688,6 +1744,7 @@ def parse_chat_messages(
                 and model_config.multimodal_config is not None
                 and model_config.multimodal_config.interleave_mm_strings
             ),
+            omit_audio_placeholder=omit_audio_placeholder,
         )
 
         conversation.extend(sub_messages)
@@ -1701,6 +1758,7 @@ def parse_chat_messages_futures(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
     content_format: _ChatTemplateContentFormat,
+    mm_processor_kwargs: Mapping[str, Any] | None = None,
 ) -> tuple[
     list[ConversationMessage],
     Awaitable[MultiModalDataDict | None],
@@ -1708,6 +1766,17 @@ def parse_chat_messages_futures(
 ]:
     conversation: list[ConversationMessage] = []
     mm_tracker = AsyncMultiModalItemTracker(model_config)
+
+    # When use_audio_in_video=True with video present AND a separate audio_url,
+    # audio is embedded within the video placeholder, so we must omit standalone
+    # audio placeholders. If audio is extracted from video (no separate audio_url),
+    # we must keep the audio placeholder for validation.
+    omit_audio_placeholder = (
+        mm_processor_kwargs is not None
+        and mm_processor_kwargs.get("use_audio_in_video", False)
+        and _messages_contain_video(messages)
+        and _messages_contain_standalone_audio(messages)
+    )
 
     for msg in messages:
         sub_messages = _parse_chat_message_content(
@@ -1719,6 +1788,7 @@ def parse_chat_messages_futures(
                 and model_config.multimodal_config is not None
                 and model_config.multimodal_config.interleave_mm_strings
             ),
+            omit_audio_placeholder=omit_audio_placeholder,
         )
 
         conversation.extend(sub_messages)
