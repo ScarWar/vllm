@@ -825,23 +825,45 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         mm_kwargs: MultiModalKwargsItems,
         mm_prompt_updates: MultiModalPromptUpdates,
         is_update_applied: bool,
+        hf_processor_mm_kwargs: Mapping[str, object] | None = None,
     ) -> tuple[list[int], str, Mapping[str, list[PlaceholderFeaturesInfo]]]:
         """
         Qwen3-Omni reimplements this function to handle `use_audio_in_video`.
         """
         mm_item_counts = mm_items.get_all_counts()
-        self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
 
-        use_audio_in_video = False
-        if "video" in mm_kwargs:
+        # Check use_audio_in_video from hf_processor_mm_kwargs (API request) first,
+        # then fall back to mm_kwargs["video"] (HF processor output)
+        use_audio_in_video = (
+            hf_processor_mm_kwargs is not None
+            and hf_processor_mm_kwargs.get("use_audio_in_video", False)
+        )
+        if not use_audio_in_video and "video" in mm_kwargs:
             for item in mm_kwargs["video"]:
-                if item and item["use_audio_in_video"].data:
+                if item and item.get("use_audio_in_video") and item["use_audio_in_video"].data:
                     use_audio_in_video = True
-                else:
-                    use_audio_in_video = False
+                    break
+
+        # Log the mode being used
+        logger.info(
+            "[Qwen3-Omni] use_audio_in_video=%s, mm_item_counts=%s",
+            use_audio_in_video, mm_item_counts
+        )
+
+        # When use_audio_in_video=True, filter out audio from item counts for validation
+        # since audio is embedded within video tokens
+        if use_audio_in_video and "audio" in mm_item_counts and "video" in mm_item_counts:
+            logger.info(
+                "[Qwen3-Omni] INTERLEAVED MODE: Audio tokens will be interleaved "
+                "with video tokens. Filtering audio from mm_item_counts."
+            )
+            mm_item_counts = {k: v for k, v in mm_item_counts.items() if k != "audio"}
+
+        self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
 
         # normal case with `use_audio_in_video=False`
         if is_update_applied:
+            logger.info("[Qwen3-Omni] Updates already applied, finding placeholders")
             mm_placeholders = self._find_mm_placeholders(
                 prompt_ids,
                 mm_prompt_updates,
@@ -852,21 +874,52 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             )
         else:
             if use_audio_in_video and "audio" in mm_prompt_updates:
+                logger.info(
+                    "[Qwen3-Omni] *** INTERLEAVED MODE ACTIVE ***\n"
+                    "  - Filtering out standalone audio placeholder\n"
+                    "  - Original modalities: %s\n"
+                    "  - Audio will be interleaved with video tokens",
+                    list(mm_prompt_updates.keys())
+                )
                 filtered_updates = {
                     k: v for k, v in mm_prompt_updates.items() if k != "audio"
                 }
+                logger.info(
+                    "[Qwen3-Omni] Applying prompt updates for: %s (audio filtered out)",
+                    list(filtered_updates.keys())
+                )
                 prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
                     filtered_updates,
                 )
                 # Derive audio placeholders from video placeholders
+                logger.info(
+                    "[Qwen3-Omni] Deriving audio placeholders from video placeholders.\n"
+                    "  - Video placeholders found: %d\n"
+                    "  - Audio data will use interleaved positions within video",
+                    len(mm_placeholders.get("video", []))
+                )
                 mm_placeholders = self._derive_audio_from_video_placeholders(
                     mm_placeholders, mm_prompt_updates
                 )
+                logger.info(
+                    "[Qwen3-Omni] After deriving: placeholders=%s",
+                    {k: len(v) for k, v in mm_placeholders.items()}
+                )
             else:
+                logger.info(
+                    "[Qwen3-Omni] *** SEPARATE MODE (default) ***\n"
+                    "  - Video and audio processed separately\n"
+                    "  - Modalities: %s",
+                    list(mm_prompt_updates.keys())
+                )
                 prompt_ids, mm_placeholders = self._apply_prompt_updates(
                     prompt_ids,
                     mm_prompt_updates,
+                )
+                logger.info(
+                    "[Qwen3-Omni] Placeholders after update: %s",
+                    {k: len(v) for k, v in mm_placeholders.items()}
                 )
 
             self._validate_mm_placeholders(
@@ -874,6 +927,11 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
                 mm_item_counts,
             )
 
+        logger.info(
+            "[Qwen3-Omni] _maybe_apply_prompt_updates complete. "
+            "Final prompt length: %d tokens, placeholders: %s",
+            len(prompt_ids), {k: len(v) for k, v in mm_placeholders.items()}
+        )
         return prompt_ids, mm_placeholders
 
     def get_updates_use_audio_in_video(
@@ -883,6 +941,13 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         video_grid_thw: list[int] | torch.Tensor,
         video_second_per_grid_t: float,
     ) -> list[int]:
+        logger.info(
+            "[Qwen3-Omni] get_updates_use_audio_in_video called:\n"
+            "  - audio_len: %d\n"
+            "  - video_grid_thw: %s\n"
+            "  - video_second_per_grid_t: %s",
+            audio_len, video_grid_thw, video_second_per_grid_t
+        )
         shift = 0
         audio_token_id = thinker_config.audio_token_id
         video_token_id = thinker_config.video_token_id
@@ -922,6 +987,19 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         if audio_data_index < len(audio_token_indices):
             updates += [audio_token_id] * (len(audio_token_indices) - audio_data_index)
         updates += [audio_end_token_id]
+        
+        # Count token types in interleaved sequence
+        num_video_tokens = updates.count(video_token_id)
+        num_audio_tokens = updates.count(audio_token_id)
+        logger.info(
+            "[Qwen3-Omni] *** INTERLEAVED TOKEN SEQUENCE CREATED ***\n"
+            "  - Total tokens: %d\n"
+            "  - Video tokens (id=%d): %d\n"
+            "  - Audio tokens (id=%d): %d\n"
+            "  - Sequence pattern (first 20): %s...",
+            len(updates), video_token_id, num_video_tokens,
+            audio_token_id, num_audio_tokens, updates[:20]
+        )
         return updates
 
     def _get_prompt_updates(
@@ -989,12 +1067,26 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         use_audio_in_video = hf_processor_mm_kwargs.get("use_audio_in_video", False)
         thinker_config = self.info.get_hf_config()
 
+        logger.info(
+            "[Qwen3-Omni] _get_prompt_updates: use_audio_in_video=%s, "
+            "audio_output_lengths=%s, hf_processor_mm_kwargs keys=%s",
+            use_audio_in_video, audio_output_lengths, list(hf_processor_mm_kwargs.keys())
+        )
+
         def get_replacement_qwen2_use_audio_in_video(item_idx: int):
             nonlocal audio_in_video_item_idx
             audio_num_features = audio_output_lengths[
                 audio_in_video_item_idx + item_idx
             ]
             video_grid_thw = out_mm_data["video_grid_thw"][item_idx]
+
+            logger.info(
+                "[Qwen3-Omni] get_replacement_qwen2_use_audio_in_video called:\n"
+                "  - item_idx: %d\n"
+                "  - audio_num_features: %d\n"
+                "  - video_grid_thw: %s",
+                item_idx, audio_num_features, video_grid_thw
+            )
 
             audio_in_video_item_idx += 1
 
@@ -1018,6 +1110,12 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             get_replacement_qwen2_use_audio_in_video
             if use_audio_in_video
             else partial(get_replacement_qwen2_vision, modality="video")
+        )
+        
+        logger.info(
+            "[Qwen3-Omni] Video replacement function: %s",
+            "INTERLEAVED (get_replacement_qwen2_use_audio_in_video)" 
+            if use_audio_in_video else "SEPARATE (get_replacement_qwen2_vision)"
         )
 
         return [

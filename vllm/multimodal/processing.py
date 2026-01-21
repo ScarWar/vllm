@@ -2303,8 +2303,22 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         mm_kwargs: MultiModalKwargsOptionalItems,
         mm_prompt_updates: MultiModalPromptUpdates,
         is_update_applied: bool,
+        hf_processor_mm_kwargs: Mapping[str, object] | None = None,
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
         mm_item_counts = mm_items.get_all_counts()
+        
+        # When use_audio_in_video=True, audio is embedded within video tokens,
+        # so we skip standalone audio placeholder replacement.
+        # The audio data is still processed but interleaved with video by the model.
+        use_audio_in_video = (
+            hf_processor_mm_kwargs is not None
+            and hf_processor_mm_kwargs.get("use_audio_in_video", False)
+        )
+        if use_audio_in_video and "audio" in mm_prompt_updates and "video" in mm_prompt_updates:
+            # Filter out audio from prompt updates - it's handled by the model
+            mm_prompt_updates = {k: v for k, v in mm_prompt_updates.items() if k != "audio"}
+            mm_item_counts = {k: v for k, v in mm_item_counts.items() if k != "audio"}
+        
         self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
         self._validate_mm_updates(mm_prompt_updates, mm_item_counts)
 
@@ -2374,6 +2388,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                 mm_kwargs=mm_info.kwargs,
                 mm_prompt_updates=mm_info.prompt_updates,
                 is_update_applied=is_update_applied,
+                hf_processor_mm_kwargs=hf_processor_mm_kwargs,
             )
 
         mm_placeholder_ranges = {
